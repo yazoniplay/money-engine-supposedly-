@@ -32,6 +32,7 @@ jobs:
       - name: Scan and deliver leads
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: gemini-3.5-flash-lite
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
           MIN_LEAD_SCORE: ${{ vars.MIN_LEAD_SCORE }}
