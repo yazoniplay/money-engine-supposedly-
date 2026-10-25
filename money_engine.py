@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SignalForge: public Reddit lead discovery, Gemini qualification, Telegram delivery."""
+"""SignalForge: public Reddit lead discovery, Gemini qualification, Discord delivery."""
 import json, os, re, sys, time, xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,18 +60,31 @@ def qualify(p):
         result=json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"]); result["score"]=max(1,min(10,int(result.get("score",1)))); return result
     except Exception as e: log("Gemini failed: "+str(e)); return None
 def deliver(p,x):
-    bot,chat=os.getenv("TELEGRAM_BOT_TOKEN"),os.getenv("TELEGRAM_CHAT_ID")
-    if not bot or not chat: raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID GitHub secret")
-    url=p.get("url",""); link='<a href="'+escape(url,quote=True)+'">Open original post</a>' if url.startswith("https://www.reddit.com/") else "Source link unavailable"
-    msg=("⚡ <b>QUALIFIED AI AUTOMATION LEAD</b>\n\n<b>"+escape(p.get("title") or "Untitled post")+"</b>\n"
-      +"Score: <b>"+str(x["score"])+"/10</b> · Intent: <b>"+escape(str(x.get("intent","unknown")))+"</b>\n"
-      +"Service: "+escape(str(x.get("service","unspecified")))+"\nProblem: "+escape(str(x.get("business_problem","unspecified")))+"\n"
-      +"Location: "+escape(str(x.get("location") or "Not specified"))+"\nBudget signal: "+escape(str(x.get("budget_signal","unknown")))+"\n"
-      +"Source: r/"+escape(str(p.get("subreddit","unknown")))+"\n\n"+escape(str(x.get("reason","")))+"\n\n"+link+
-      "\n<i>AI triage only; verify intent before acting.</i>")
+    webhook=os.getenv("DISCORD_WEBHOOK_URL")
+    if not webhook: raise RuntimeError("Missing DISCORD_WEBHOOK_URL GitHub secret")
+    url=p.get("url","")
+    embed={
+      "title": (p.get("title") or "Untitled post")[:256],
+      "url": url if url.startswith("https://www.reddit.com/") else None,
+      "description": str(x.get("reason",""))[:4000],
+      "color": 0x5865F2,
+      "fields": [
+        {"name":"Score","value":str(x.get("score",1))+"/10","inline":True},
+        {"name":"Intent","value":str(x.get("intent","unknown"))[:100],"inline":True},
+        {"name":"Service","value":str(x.get("service","unspecified"))[:1024],"inline":False},
+        {"name":"Business problem","value":str(x.get("business_problem","unspecified"))[:1024],"inline":False},
+        {"name":"Location","value":str(x.get("location") or "Not specified")[:1024],"inline":True},
+        {"name":"Budget signal","value":str(x.get("budget_signal","unknown"))[:100],"inline":True},
+        {"name":"Source","value":("r/"+str(p.get("subreddit","unknown")))[:1024],"inline":True}
+      ],
+      "footer":{"text":"SignalForge • AI triage only; verify intent before acting"}
+    }
+    if not embed["url"]: embed["url"]=None
     try:
-        r=S.post("https://api.telegram.org/bot"+bot+"/sendMessage",json={"chat_id":chat,"text":msg,"parse_mode":"HTML","disable_web_page_preview":True},timeout=20); r.raise_for_status(); return bool(r.json().get("ok"))
-    except Exception as e: log("Telegram delivery failed: "+str(e)); return False
+        r=S.post(webhook,json={"username":"SignalForge Leads","embeds":[embed],"allowed_mentions":{"parse":[]}},timeout=20)
+        r.raise_for_status()
+        return r.status_code in (200,204)
+    except Exception as e: log("Discord delivery failed: "+str(e)); return False
 def main():
     minimum=int(os.getenv("MIN_LEAD_SCORE","8")); age=int(os.getenv("MAX_POST_AGE_HOURS","72"))
     terms=[x.strip() for x in os.getenv("SEARCH_TERMS",",".join(DEFAULT_TERMS)).split(",") if x.strip()]
