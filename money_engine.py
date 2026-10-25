@@ -7,7 +7,17 @@ from html import escape
 import requests
 
 STATE = Path("data/state.json")
-DEFAULT_TERMS = ["looking for AI automation","need AI automation","AI agent implementation","LLM integration","automate our workflow","AI customer support automation","AI automation agency recommendation"]
+DEFAULT_TERMS = [
+    '"looking for" AI automation', '"need help" AI automation', '"recommend" AI automation agency',
+    '"looking for" AI agent', '"need an AI agent"', '"AI automation" consultant',
+    '"AI implementation" business', '"LLM integration" help', '"automate our workflow"',
+    '"automate our business"', '"customer support automation"', '"AI chatbot" business help',
+    '"AI workflow" consultant', '"hire" "AI automation"', '"looking for a developer" AI',
+    '"AI agency" recommendation', '"business process automation" AI', '"AI integration" company',
+    '"AI receptionist" business', '"lead generation automation"', '"internal tools" AI',
+    '"custom AI solution" business', '"AI agent" implementation', '"workflow automation" help',
+    '"anyone know" AI automation', '"need someone" AI integration'
+]
 DEFAULT_SUBS = ["SaaS","Entrepreneur","smallbusiness","artificial"]
 HEADERS = {"User-Agent": os.getenv("REDDIT_USER_AGENT","SignalForge/1.0 (public lead research)")}
 S = requests.Session(); S.headers.update(HEADERS)
@@ -20,22 +30,23 @@ def load_state():
 def save_state(x):
     STATE.parent.mkdir(parents=True,exist_ok=True); x["seen"]=x["seen"][-5000:]; x["last_run"]=datetime.now(timezone.utc).isoformat()
     tmp=STATE.with_suffix(".tmp"); tmp.write_text(json.dumps(x,indent=2)); tmp.replace(STATE)
-def apify_search(terms, subs):
+def apify_search(terms):
     """Search public Reddit posts through Apify; no Reddit OAuth credentials needed."""
     api_key = os.getenv("APIFY_API_TOKEN", "").strip()
     if not api_key:
         raise RuntimeError("Missing APIFY_API_TOKEN GitHub Actions secret")
-    searches = [f"subreddit:{sub} {term}" for sub in subs for term in terms]
+    # Search across Reddit globally, not just a hand-picked subreddit list.
+    searches = list(dict.fromkeys(term.strip() for term in terms if term.strip()))
     max_items = env_int("APIFY_MAX_ITEMS", 100)
     actor_input = {
         "searches": searches,
         "sort": "new",
-        "time": "week",
+        "time": "all",
         "maxItems": max_items,
-        "maxPostCount": 25,
+        "maxPostCount": 1000,
         "maxComments": 0
     }
-    log(f"Starting Apify Reddit search: {len(searches)} queries, max {max_items} results")
+    log(f"Starting global Apify Reddit search: {len(searches)} queries across all public subreddits, all-time search, max {max_items} results")
     endpoint = "https://api.apify.com/v2/acts/trudax~reddit-scraper-lite/run-sync-get-dataset-items"
     response = S.post(
         endpoint,
@@ -143,9 +154,8 @@ def env_csv(name, defaults):
 def main():
     minimum=env_int("MIN_LEAD_SCORE", 8); age=env_int("MAX_POST_AGE_HOURS", 72)
     terms=env_csv("SEARCH_TERMS", DEFAULT_TERMS)
-    subs=env_csv("SUBREDDITS", DEFAULT_SUBS)
     state=load_state(); seen=set(map(str,state["seen"]))
-    posts_list=apify_search(terms, subs)
+    posts_list=apify_search(terms)
     posts={p["id"]:p for p in posts_list if p.get("id") and p.get("url")}
     log("Discovered "+str(len(posts))+" unique posts")
     delivered=checked=0; now=time.time()
