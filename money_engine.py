@@ -85,10 +85,23 @@ def deliver(p,x):
         r.raise_for_status()
         return r.status_code in (200,204)
     except Exception as e: log("Discord delivery failed: "+str(e)); return False
+def env_int(name, default):
+    """Read an integer setting; blank GitHub Actions variables use the default."""
+    raw=os.getenv(name, "").strip()
+    if not raw: return default
+    try: return int(raw)
+    except ValueError: raise ValueError(f"{name} must be an integer, got {raw!r}")
+
+def env_csv(name, defaults):
+    """Read a comma-separated setting; missing or blank values use defaults."""
+    raw=os.getenv(name, "").strip()
+    values=[x.strip() for x in raw.split(",") if x.strip()] if raw else []
+    return values or list(defaults)
+
 def main():
-    minimum=int(os.getenv("MIN_LEAD_SCORE","8")); age=int(os.getenv("MAX_POST_AGE_HOURS","72"))
-    terms=[x.strip() for x in os.getenv("SEARCH_TERMS",",".join(DEFAULT_TERMS)).split(",") if x.strip()]
-    subs=[x.strip() for x in os.getenv("SUBREDDITS",",".join(DEFAULT_SUBS)).split(",") if x.strip()]
+    minimum=env_int("MIN_LEAD_SCORE", 8); age=env_int("MAX_POST_AGE_HOURS", 72)
+    terms=env_csv("SEARCH_TERMS", DEFAULT_TERMS)
+    subs=env_csv("SUBREDDITS", DEFAULT_SUBS)
     state=load_state(); seen=set(map(str,state["seen"])); tok=token(); posts={}
     for term in terms:
         for sub in subs:
