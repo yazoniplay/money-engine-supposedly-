@@ -43,14 +43,24 @@ def apify_search(terms):
     base = "https://api.apify.com/v2"
     log(f"Starting bounded Apify Reddit search: {len(searches)} global queries (first 8), all-time, max {max_items} results")
 
-    # Start asynchronously so a quiet, long synchronous HTTP request cannot look frozen.
-    response = S.post(
-        base + "/acts/trudax~reddit-scraper-lite/runs",
-        params={"waitForFinish": 60, "maxItems": max_items},
-        headers=headers,
-        json=actor_input,
-        timeout=(15, 75)
-    )
+    # Return immediately from Apify; poll the run separately below.
+    # A short-lived connection drop can happen before the API response is fully received.
+    try:
+        response = S.post(
+            base + "/acts/trudax~reddit-scraper-lite/runs",
+            params={"waitForFinish": 0, "maxItems": max_items},
+            headers=headers,
+            json=actor_input,
+            timeout=(15, 45)
+        )
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.ChunkedEncodingError) as e:
+        # Do not blindly retry a POST: Apify may have started the actor before the
+        # connection dropped, and retrying could create a duplicate paid run.
+        raise RuntimeError(
+            "Connection to Apify dropped while starting the run, so its run ID is unknown. "
+            "Check Apify Console for a newly started run before rerunning this workflow. "
+            f"Network error: {type(e).__name__}: {e}"
+        ) from e
     if not response.ok:
         raise RuntimeError(f"Apify failed to start ({response.status_code}): {response.text[:800]}")
     run = response.json().get("data", {})
