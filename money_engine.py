@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SignalForge: public Reddit lead discovery, Gemini qualification, Discord delivery."""
+"""SignalForge: Apify Reddit discovery, Gemini qualification, Discord delivery."""
 import json, os, re, sys, time, xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,31 +20,73 @@ def load_state():
 def save_state(x):
     STATE.parent.mkdir(parents=True,exist_ok=True); x["seen"]=x["seen"][-5000:]; x["last_run"]=datetime.now(timezone.utc).isoformat()
     tmp=STATE.with_suffix(".tmp"); tmp.write_text(json.dumps(x,indent=2)); tmp.replace(STATE)
-def token():
-    a,b=os.getenv("REDDIT_CLIENT_ID"),os.getenv("REDDIT_CLIENT_SECRET")
-    if not a or not b: return None
-    try:
-        r=requests.post("https://www.reddit.com/api/v1/access_token",auth=(a,b),data={"grant_type":"client_credentials"},headers=HEADERS,timeout=15); r.raise_for_status(); return r.json().get("access_token")
-    except Exception as e: log("Reddit OAuth unavailable; fallback RSS: "+str(e)); return None
-def normalize(p):
-    permalink=p.get("permalink",""); url=p.get("url") or ("https://www.reddit.com"+permalink if permalink.startswith("/") else "")
-    return {"id":str(p.get("id") or url),"title":p.get("title",""),"text":p.get("selftext",""),"url":url,"created_utc":p.get("created_utc"),"subreddit":p.get("subreddit","")}
-def search(term,sub,tok):
-    q=("subreddit:"+sub+" " if sub else "")+term
-    if tok:
-        try:
-            r=S.get("https://oauth.reddit.com/search",params={"q":q,"sort":"new","t":"week","limit":25,"type":"link"},headers={"Authorization":"Bearer "+tok},timeout=20); r.raise_for_status()
-            return [normalize(x["data"]) for x in r.json().get("data",{}).get("children",[])]
-        except Exception as e: log("Reddit API search failed: "+str(e))
-    try:
-        r=S.get("https://www.reddit.com/search.rss",params={"q":q,"sort":"new","t":"week"},headers={"Accept":"application/rss+xml"},timeout=20); r.raise_for_status()
-        root=ET.fromstring(r.text); out=[]
-        for x in root.findall(".//item"):
-            url=(x.findtext("link") or "").strip(); title=(x.findtext("title") or "").strip()
-            desc=re.sub(r"\s+"," ",re.sub(r"<[^>]+>"," ",x.findtext("description") or "")).strip()
-            out.append({"id":url.rstrip("/").split("/")[-1] or url,"title":title,"text":desc[:5000],"url":url,"created_utc":None,"subreddit":sub})
-        return out
-    except Exception as e: log("RSS unavailable: "+str(e)); return []
+def apify_search(terms, subs):
+    """Search public Reddit posts through Apify; no Reddit OAuth credentials needed."""
+    api_key = os.getenv("APIFY_API_TOKEN", "").strip()
+    if not api_key:
+        raise RuntimeError("Missing APIFY_API_TOKEN GitHub Actions secret")
+    searches = [f"subreddit:{sub} {term}" for sub in subs for term in terms]
+    max_items = env_int("APIFY_MAX_ITEMS", 100)
+    actor_input = {
+        "searches": searches,
+        "sort": "new",
+        "time": "week",
+        "maxItems": max_items,
+        "maxPostCount": 25,
+        "maxComments": 0
+    }
+    log(f"Starting Apify Reddit search: {len(searches)} queries, max {max_items} results")
+    endpoint = "https://api.apify.com/v2/acts/trudax~reddit-scraper-lite/run-sync-get-dataset-items"
+    response = S.post(
+        endpoint,
+        params={"waitForFinish": 240, "format": "json", "clean": "true"},
+        headers={"Authorization": "Bearer " + api_key},
+        json=actor_input,
+        timeout=270
+    )
+    if not response.ok:
+        raise RuntimeError(f"Apify request failed ({response.status_code}): {response.text[:800]}")
+    items = response.json()
+    if not isinstance(items, list):
+        raise RuntimeError("Apify returned an unexpected response; expected a list of dataset items")
+    posts = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or item.get("postUrl") or item.get("permalink") or "").strip()
+        if url.startswith("/"):
+            url = "https://www.reddit.com" + url
+        title = str(item.get("title") or item.get("postTitle") or "").strip()
+        body = str(item.get("selftext") or item.get("body") or item.get("text") or item.get("description") or "").strip()
+        if not url or not title:
+            continue
+        raw_created = item.get("created_utc") or item.get("createdAt") or item.get("createdAtISO") or item.get("publishedAt")
+        created = None
+        if raw_created is not None:
+            try:
+                if isinstance(raw_created, (int, float)):
+                    created = float(raw_created)
+                else:
+                    parsed = datetime.fromisoformat(str(raw_created).replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    created = parsed.timestamp()
+            except (ValueError, TypeError, OverflowError):
+                created = None
+        raw_sub = str(item.get("subredditName") or item.get("subreddit") or item.get("communityName") or "unknown")
+        raw_sub = raw_sub.removeprefix("r/").removeprefix("/r/")
+        post_id = str(item.get("id") or item.get("postId") or url.rstrip("/").split("/")[-1])
+        posts.setdefault(post_id, {
+            "id": post_id,
+            "title": title,
+            "text": body[:10000],
+            "url": url,
+            "created_utc": created,
+            "subreddit": raw_sub
+        })
+    log(f"Apify returned {len(items)} dataset rows; normalized {len(posts)} unique posts")
+    return list(posts.values())
+
 def prefilter(p):
     text=(p.get("title","")+" "+p.get("text","")).lower()
     signals=["looking for","need help","recommend","hiring","hire","agency","consultant","implement","automate","automation","workflow","integration","customer support","ai agent","llm"]
@@ -102,12 +144,9 @@ def main():
     minimum=env_int("MIN_LEAD_SCORE", 8); age=env_int("MAX_POST_AGE_HOURS", 72)
     terms=env_csv("SEARCH_TERMS", DEFAULT_TERMS)
     subs=env_csv("SUBREDDITS", DEFAULT_SUBS)
-    state=load_state(); seen=set(map(str,state["seen"])); tok=token(); posts={}
-    for term in terms:
-        for sub in subs:
-            for p in search(term,sub,tok):
-                if p.get("id") and p.get("url"): posts.setdefault(p["id"],p)
-            time.sleep(0.8)
+    state=load_state(); seen=set(map(str,state["seen"]))
+    posts_list=apify_search(terms, subs)
+    posts={p["id"]:p for p in posts_list if p.get("id") and p.get("url")}
     log("Discovered "+str(len(posts))+" unique posts")
     delivered=checked=0; now=time.time()
     for pid,p in posts.items():
@@ -121,7 +160,10 @@ def main():
             else: log("Delivery failed; will retry "+pid)
         else: seen.add(pid)
         time.sleep(1)
-    state["seen"]=list(seen); save_state(state); log("Done. Checked="+str(checked)+" delivered="+str(delivered))
+    state["seen"]=list(seen); save_state(state)
+    log("Done. Checked="+str(checked)+" delivered="+str(delivered))
+    if not posts:
+        raise RuntimeError("Apify returned zero usable posts; workflow marked failed instead of silently succeeding")
 if __name__=="__main__":
     try: main()
     except Exception as e: log("FATAL: "+str(e)); sys.exit(1)
