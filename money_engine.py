@@ -36,8 +36,8 @@ def apify_search(terms):
     if not api_key:
         raise RuntimeError("Missing APIFY_API_TOKEN GitHub Actions secret")
 
-    searches = list(dict.fromkeys(term.strip() for term in terms if term.strip()))
-    max_items = env_int("APIFY_MAX_ITEMS", 100)
+    searches = list(dict.fromkeys(term.strip() for term in terms if term.strip()))[:8]
+    max_items = env_int("APIFY_MAX_ITEMS", 50)
     actor_input = {
         "searches": searches,
         "sort": "new",
@@ -48,7 +48,7 @@ def apify_search(terms):
     }
     headers = {"Authorization": "Bearer " + api_key}
     base = "https://api.apify.com/v2"
-    log(f"Starting Apify Reddit search: {len(searches)} global queries, all-time, max {max_items} results")
+    log(f"Starting bounded Apify Reddit search: {len(searches)} global queries (first 8), all-time, max {max_items} results")
 
     # Start asynchronously so a quiet, long synchronous HTTP request cannot look frozen.
     response = S.post(
@@ -68,7 +68,7 @@ def apify_search(terms):
         raise RuntimeError("Apify did not return a run ID: " + response.text[:500])
     log(f"Apify run {run_id} started; status={status}")
 
-    deadline = time.monotonic() + 300
+    deadline = time.monotonic() + 720
     while status not in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT") and time.monotonic() < deadline:
         time.sleep(10)
         try:
@@ -88,7 +88,13 @@ def apify_search(terms):
             continue
 
     if status != "SUCCEEDED":
-        raise RuntimeError(f"Apify run {run_id} did not succeed before the 5-minute wait limit (status={status}). Check the run in Apify Console; it may still be running.")
+        # Best-effort abort so a timed-out workflow does not leave an actor consuming usage.
+        try:
+            abort = S.delete(base + "/actor-runs/" + run_id, headers=headers, timeout=(10, 20))
+            log(f"Requested abort for timed-out Apify run {run_id}; HTTP {abort.status_code}")
+        except requests.RequestException as e:
+            log(f"Could not abort timed-out Apify run {run_id}: {e}")
+        raise RuntimeError(f"Apify run {run_id} did not succeed within the 12-minute wait limit (status={status}). Check Apify Console for the actor's own error logs.")
     if not dataset_id:
         raise RuntimeError(f"Apify run {run_id} succeeded but returned no dataset ID")
 
