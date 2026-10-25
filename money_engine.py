@@ -31,11 +31,11 @@ def save_state(x):
     STATE.parent.mkdir(parents=True,exist_ok=True); x["seen"]=x["seen"][-5000:]; x["last_run"]=datetime.now(timezone.utc).isoformat()
     tmp=STATE.with_suffix(".tmp"); tmp.write_text(json.dumps(x,indent=2)); tmp.replace(STATE)
 def apify_search(terms):
-    """Search public Reddit posts through Apify; no Reddit OAuth credentials needed."""
+    """Start an Apify run, report progress while waiting, then fetch its dataset."""
     api_key = os.getenv("APIFY_API_TOKEN", "").strip()
     if not api_key:
         raise RuntimeError("Missing APIFY_API_TOKEN GitHub Actions secret")
-    # Search across Reddit globally, not just a hand-picked subreddit list.
+
     searches = list(dict.fromkeys(term.strip() for term in terms if term.strip()))
     max_items = env_int("APIFY_MAX_ITEMS", 100)
     actor_input = {
@@ -46,20 +46,63 @@ def apify_search(terms):
         "maxPostCount": 1000,
         "maxComments": 0
     }
-    log(f"Starting global Apify Reddit search: {len(searches)} queries across all public subreddits, all-time search, max {max_items} results")
-    endpoint = "https://api.apify.com/v2/acts/trudax~reddit-scraper-lite/run-sync-get-dataset-items"
+    headers = {"Authorization": "Bearer " + api_key}
+    base = "https://api.apify.com/v2"
+    log(f"Starting Apify Reddit search: {len(searches)} global queries, all-time, max {max_items} results")
+
+    # Start asynchronously so a quiet, long synchronous HTTP request cannot look frozen.
     response = S.post(
-        endpoint,
-        params={"waitForFinish": 240, "format": "json", "clean": "true"},
-        headers={"Authorization": "Bearer " + api_key},
+        base + "/acts/trudax~reddit-scraper-lite/runs",
+        params={"waitForFinish": 60, "maxItems": max_items},
+        headers=headers,
         json=actor_input,
-        timeout=270
+        timeout=(15, 75)
     )
     if not response.ok:
-        raise RuntimeError(f"Apify request failed ({response.status_code}): {response.text[:800]}")
+        raise RuntimeError(f"Apify failed to start ({response.status_code}): {response.text[:800]}")
+    run = response.json().get("data", {})
+    run_id = run.get("id")
+    status = run.get("status", "UNKNOWN")
+    dataset_id = (run.get("defaultDatasetId") or "")
+    if not run_id:
+        raise RuntimeError("Apify did not return a run ID: " + response.text[:500])
+    log(f"Apify run {run_id} started; status={status}")
+
+    deadline = time.monotonic() + 300
+    while status not in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT") and time.monotonic() < deadline:
+        time.sleep(10)
+        try:
+            poll = S.get(
+                base + "/actor-runs/" + run_id,
+                params={"waitForFinish": 20},
+                headers=headers,
+                timeout=(15, 30)
+            )
+            poll.raise_for_status()
+            run = poll.json().get("data", {})
+            status = run.get("status", "UNKNOWN")
+            dataset_id = run.get("defaultDatasetId") or dataset_id
+            log(f"Apify run {run_id}: status={status}")
+        except requests.RequestException as e:
+            log(f"Apify status check failed temporarily: {e}")
+            continue
+
+    if status != "SUCCEEDED":
+        raise RuntimeError(f"Apify run {run_id} did not succeed before the 5-minute wait limit (status={status}). Check the run in Apify Console; it may still be running.")
+    if not dataset_id:
+        raise RuntimeError(f"Apify run {run_id} succeeded but returned no dataset ID")
+
+    response = S.get(
+        base + "/datasets/" + dataset_id + "/items",
+        params={"format": "json", "clean": "true", "limit": max_items},
+        headers=headers,
+        timeout=(15, 45)
+    )
+    if not response.ok:
+        raise RuntimeError(f"Could not fetch Apify dataset ({response.status_code}): {response.text[:800]}")
     items = response.json()
     if not isinstance(items, list):
-        raise RuntimeError("Apify returned an unexpected response; expected a list of dataset items")
+        raise RuntimeError("Apify returned an unexpected dataset response; expected a list")
     posts = {}
     for item in items:
         if not isinstance(item, dict):
@@ -95,7 +138,7 @@ def apify_search(terms):
             "created_utc": created,
             "subreddit": raw_sub
         })
-    log(f"Apify returned {len(items)} dataset rows; normalized {len(posts)} unique posts")
+    log(f"Apify dataset returned {len(items)} rows; normalized {len(posts)} unique posts")
     return list(posts.values())
 
 def prefilter(p):
