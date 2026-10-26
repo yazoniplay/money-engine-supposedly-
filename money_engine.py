@@ -36,8 +36,18 @@ DEFAULT_SEARCH_TERMS = [
     "automate lead gen", "AI pipeline", "hire AI", "AI expert"
 ]
 
-REDDIT_CONCURRENCY = int(os.getenv("REDDIT_CONCURRENCY", "6"))
-GEMINI_CONCURRENCY = int(os.getenv("GEMINI_CONCURRENCY", "4"))
+def get_env_int(key, default):
+    val = os.getenv(key)
+    if val is None or val.strip() == "":
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        logger.warning(f"Environment variable {key} has invalid value '{val}', using default {default}")
+        return default
+
+REDDIT_CONCURRENCY = get_env_int("REDDIT_CONCURRENCY", 6)
+GEMINI_CONCURRENCY = get_env_int("GEMINI_CONCURRENCY", 4)
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -132,7 +142,7 @@ def analyze_with_gemini(posts, api_key, model):
         return []
         
     scored_posts = []
-    min_score = int(os.getenv("MIN_LEAD_SCORE", "7"))
+    min_score = get_env_int("MIN_LEAD_SCORE", 8)
     
     if not api_key:
         logger.warning("No GEMINI_API_KEY provided. Using high-speed keyword heuristic scoring.")
@@ -214,54 +224,57 @@ def send_discord_notification(lead, webhook_url):
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(webhook_url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    for attempt in range(3):
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                logger.info(f"Sent lead to Discord: {lead['title'][:50]}")
-                return
-        except Exception as e:
-            if attempt == 2:
-                logger.error(f"Failed to send Discord notification after 3 attempts: {e}")
-            time.sleep(1)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status not in (200, 204):
+                logger.warning(f"Discord notification failed with status {resp.status}")
+    except Exception as e:
+        logger.error(f"Failed to send Discord webhook: {e}")
 
 def main():
     logger.info("Starting SignalForge high-speed expanded lead scan...")
     
-    sub_env = os.getenv("SUBREDDITS")
+    gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip() or "gemini-1.5-flash"
+    discord_webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+    max_age_hours = get_env_int("MAX_POST_AGE_HOURS", 72)
+    
+    sub_env = os.getenv("SUBREDDITS", "").strip()
     if sub_env:
         subreddits = [s.strip() for s in sub_env.split(",") if s.strip()]
     else:
         subreddits = DEFAULT_SUBREDDITS
         
-    term_env = os.getenv("SEARCH_TERMS")
-    if term_env:
-        search_terms = [t.strip() for t in term_env.split(",") if t.strip()]
+    search_env = os.getenv("SEARCH_TERMS", "").strip()
+    if search_env:
+        search_terms = [t.strip() for t in search_env.split(",") if t.strip()]
     else:
         search_terms = DEFAULT_SEARCH_TERMS
         
-    max_age_hours = int(os.getenv("MAX_POST_AGE_HOURS", "72"))
-    gemini_api_key = os.getenv("GEMINI_API_KEY", "")
-    gemini_model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-lite")
-    discord_webhook = os.getenv("DISCORD_WEBHOOK_URL", "")
-    
     state = load_state()
     seen_ids = set(state.get("seen_ids", []))
     
+    logger.info(f"Scanning {len(subreddits)} subreddits with {len(search_terms)} search terms (Max age: {max_age_hours}h)...")
     posts = fetch_reddit_posts(subreddits, search_terms, max_age_hours)
-    logger.info(f"Fetched {len(posts)} total raw posts across {len(subreddits)} subreddits and {len(search_terms)} search terms.")
+    logger.info(f"Fetched {len(posts)} total raw posts across subreddits.")
     
     new_posts = [p for p in posts if p["id"] not in seen_ids]
-    logger.info(f"{len(new_posts)} posts remain after deduplication.")
+    logger.info(f"{len(new_posts)} posts are new since last state sync.")
     
+    if not new_posts:
+        logger.info("No new posts to analyze.")
+        return
+        
+    logger.info(f"Analyzing {len(new_posts)} posts with Gemini / heuristics...")
     scored_leads = analyze_with_gemini(new_posts, gemini_api_key, gemini_model)
-    logger.info(f"Found {len(scored_leads)} high-intent qualified leads.")
-    
-    scored_leads.sort(key=lambda x: x.get("score", 0), reverse=True)
+    logger.info(f"Found {len(scored_leads)} high-intent leads meeting score threshold.")
     
     for lead in scored_leads:
         send_discord_notification(lead, discord_webhook)
-        seen_ids.add(lead["id"])
         time.sleep(0.2)
+        
+    for p in new_posts:
+        seen_ids.add(p["id"])
         
     state["seen_ids"] = list(seen_ids)
     save_state(state)
