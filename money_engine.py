@@ -8,6 +8,7 @@ import urllib.error
 import urllib.parse
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import BoundedSemaphore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,33 +20,24 @@ logger = logging.getLogger("SignalForge")
 STATE_FILE = os.path.join("data", "state.json")
 
 DEFAULT_SUBREDDITS = [
-    "forhire",
-    "freelance_forhire",
-    "startups",
-    "entrepreneur",
-    "smallbusiness",
-    "SaaS",
-    "ArtificialInteligence",
-    "LocalLLaMA",
-    "automation",
-    "nocode"
+    "forhire", "freelance_forhire", "startups", "entrepreneur",
+    "smallbusiness", "SaaS", "ArtificialInteligence", "LocalLLaMA",
+    "automation", "nocode", "businessautomation", "solopreneur",
+    "AIagents", "ChatGPTCoding", "python", "growthhacking",
+    "machinelearning", "mlops", "productivity", "techbiz", "hiring", "jobbit"
 ]
 
 DEFAULT_SEARCH_TERMS = [
-    "AI automation",
-    "build AI agent",
-    "chatbot developer",
-    "automate workflow",
-    "LLM integration",
-    "Zapier alternative",
-    "custom GPT",
-    "AI scraping",
-    "lead generation bot",
-    "AI developer needed",
-    "AI automation agency",
-    "LLM consultant",
-    "automate my business"
+    "AI automation", "build AI agent", "chatbot developer",
+    "automate workflow", "LLM integration", "Zapier alternative",
+    "custom GPT", "AI scraping", "lead generation bot",
+    "AI developer needed", "AI automation agency", "LLM consultant",
+    "automate my business", "hire AI expert", "workflow automation",
+    "automate lead gen", "AI pipeline", "hire AI", "AI expert"
 ]
+
+REDDIT_CONCURRENCY = int(os.getenv("REDDIT_CONCURRENCY", "6"))
+GEMINI_CONCURRENCY = int(os.getenv("GEMINI_CONCURRENCY", "4"))
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -59,58 +51,79 @@ def load_state():
 def save_state(state):
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     try:
-        if "seen_ids" in state and len(state["seen_ids"]) > 2000:
-            state["seen_ids"] = state["seen_ids"][-2000:]
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
+        if "seen_ids" in state and len(state["seen_ids"]) > 5000:
+            state["seen_ids"] = state["seen_ids"][-5000:]
+        tmp_file = STATE_FILE + ".tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(state, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, STATE_FILE)
     except Exception as e:
-        logger.error(f"Could not save state file: {e}")
+        logger.error(f"Could not save state file atomically: {e}")
 
 def fetch_reddit_posts(subreddits, search_terms, max_age_hours):
     posts = []
     seen_urls = set()
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
-    
-    user_agent = os.getenv("REDDIT_USER_AGENT", "SignalForgeBot/2.0")
+    user_agent = os.getenv("REDDIT_USER_AGENT", "SignalForgeBot/3.0")
     headers = {"User-Agent": user_agent}
     
-    for sub in subreddits:
-        for term in search_terms:
-            query = urllib.parse.quote(term)
-            url = f"https://www.reddit.com/r/{sub}/search.json?q={query}&restrict_sr=1&sort=new&limit=25"
-            req = urllib.request.Request(url, headers=headers)
+    reddit_sem = BoundedSemaphore(REDDIT_CONCURRENCY)
+
+    def fetch_sub_term(sub, term):
+        local_posts = []
+        query = urllib.parse.quote(term, safe="")
+        url = f"https://www.reddit.com/r/{sub}/search.json?q={query}&restrict_sr=1&sort=new&limit=50"
+        req = urllib.request.Request(url, headers=headers)
+        reddit_sem.acquire()
+        try:
+            with urllib.request.urlopen(req, timeout=12) as response:
+                data = json.loads(response.read().decode("utf-8"))
+                children = data.get("data", {}).get("children", [])
+                for child in children:
+                    pdata = child.get("data", {})
+                    pid = pdata.get("id")
+                    if not pid:
+                        continue
+                    title = pdata.get("title", "")
+                    selftext = pdata.get("selftext", "")
+                    created_utc = pdata.get("created_utc", 0)
+                    permalink = pdata.get("permalink", "")
+                    url_link = pdata.get("url", "")
+                    
+                    post_time = datetime.fromtimestamp(created_utc, tz=timezone.utc)
+                    if post_time < cutoff:
+                        continue
+                        
+                    full_url = f"https://reddit.com{permalink}" if permalink else url_link
+                    
+                    local_posts.append({
+                        "id": f"reddit_{pid}",
+                        "title": title,
+                        "content": selftext[:2000],
+                        "url": full_url,
+                        "source": f"r/{sub}"
+                    })
+        except Exception as e:
+            logger.debug(f"Error fetching r/{sub} for '{term}': {e}")
+        finally:
+            reddit_sem.release()
+        return local_posts
+
+    tasks = [(sub, term) for sub in subreddits for term in search_terms]
+    with ThreadPoolExecutor(max_workers=REDDIT_CONCURRENCY) as executor:
+        futures = {executor.submit(fetch_sub_term, sub, term): (sub, term) for sub, term in tasks}
+        for future in as_completed(futures):
             try:
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    data = json.loads(response.read().decode("utf-8"))
-                    children = data.get("data", {}).get("children", [])
-                    for child in children:
-                        pdata = child.get("data", {})
-                        pid = pdata.get("id")
-                        title = pdata.get("title", "")
-                        selftext = pdata.get("selftext", "")
-                        created_utc = pdata.get("created_utc", 0)
-                        permalink = pdata.get("permalink", "")
-                        url_link = pdata.get("url", "")
-                        
-                        post_time = datetime.fromtimestamp(created_utc, tz=timezone.utc)
-                        if post_time < cutoff:
-                            continue
-                            
-                        full_url = f"https://reddit.com{permalink}" if permalink else url_link
-                        if full_url in seen_urls:
-                            continue
-                        seen_urls.add(full_url)
-                        
-                        posts.append({
-                            "id": f"reddit_{pid}",
-                            "title": title,
-                            "content": selftext[:1500],
-                            "url": full_url,
-                            "source": f"r/{sub}"
-                        })
+                res = future.result()
+                for p in res:
+                    if p["url"] not in seen_urls:
+                        seen_urls.add(p["url"])
+                        posts.append(p)
             except Exception as e:
-                logger.debug(f"Error fetching r/{sub} for '{term}': {e}")
-            time.sleep(0.3)
+                logger.debug(f"Task execution error: {e}")
+            time.sleep(0.02)
             
     return posts
 
@@ -132,39 +145,48 @@ def analyze_with_gemini(posts, api_key, model):
                 scored_posts.append(p)
         return scored_posts
 
+    gemini_sem = BoundedSemaphore(GEMINI_CONCURRENCY)
+
     def evaluate_single_post(p):
         prompt = (
-            "You are an expert B2B sales lead qualification AI. "
-            "Analyze the following post and determine if the author is actively looking to hire or buy AI automation, "
-            "AI agents, custom LLM solutions, or workflow automation services.\n"
-            f"Title: {p['title']}\n"
-            f"Content: {p['content']}\n\n"
+            "You are a B2B Lead Qualification Expert. Analyze if the author is actively seeking to HIRE or BUY AI automation, "
+            "AI agents, custom LLM solutions, or workflow automation. Look for intent signals like 'looking for', 'recommendations', "
+            "'need a developer', 'how to automate'.\n"
+            f"Title: {p['title']}\nContent: {p['content']}\n\n"
             "Return ONLY a valid JSON object with keys: 'score' (integer 1-10) and 'rationale' (string explanation)."
         )
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
         data = json.dumps(payload).encode("utf-8")
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
         
+        gemini_sem.acquire()
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                res_data = json.loads(resp.read().decode("utf-8"))
-                candidates = res_data.get("candidates", [])
-                if candidates:
-                    text_resp = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "{}")
-                    text_resp = text_resp.replace("```json", "").replace("```", "").strip()
-                    parsed = json.loads(text_resp)
-                    score = int(parsed.get("score", 0))
-                    rationale = parsed.get("rationale", "")
-                    if score >= min_score:
-                        p["score"] = score
-                        p["rationale"] = rationale
-                        return p
-        except Exception as e:
-            logger.debug(f"Gemini scoring error for post {p['id']}: {e}")
+            for attempt in range(2):
+                req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+                try:
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        res_data = json.loads(resp.read().decode("utf-8"))
+                        candidates = res_data.get("candidates", [])
+                        if candidates:
+                            text_resp = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "{}")
+                            text_resp = text_resp.replace("```json", "").replace("```", "").strip()
+                            parsed = json.loads(text_resp)
+                            score = int(parsed.get("score", 0))
+                            rationale = parsed.get("rationale", "")
+                            if score >= min_score:
+                                p["score"] = score
+                                p["rationale"] = rationale
+                                return p
+                            return None
+                except Exception as e:
+                    if attempt == 1:
+                        logger.debug(f"Gemini scoring error for post {p['id']}: {e}")
+                    time.sleep(0.5)
+        finally:
+            gemini_sem.release()
         return None
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=GEMINI_CONCURRENCY) as executor:
         futures = {executor.submit(evaluate_single_post, p): p for p in posts}
         for future in as_completed(futures):
             res = future.result()
@@ -192,14 +214,18 @@ def send_discord_notification(lead, webhook_url):
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(webhook_url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            logger.info(f"Sent lead to Discord: {lead['title'][:50]}")
-    except Exception as e:
-        logger.error(f"Failed to send Discord notification: {e}")
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                logger.info(f"Sent lead to Discord: {lead['title'][:50]}")
+                return
+        except Exception as e:
+            if attempt == 2:
+                logger.error(f"Failed to send Discord notification after 3 attempts: {e}")
+            time.sleep(1)
 
 def main():
-    logger.info("Starting SignalForge high-speed lead scan...")
+    logger.info("Starting SignalForge high-speed expanded lead scan...")
     
     sub_env = os.getenv("SUBREDDITS")
     if sub_env:
@@ -215,28 +241,31 @@ def main():
         
     max_age_hours = int(os.getenv("MAX_POST_AGE_HOURS", "72"))
     gemini_api_key = os.getenv("GEMINI_API_KEY", "")
-    gemini_model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-lite")
     discord_webhook = os.getenv("DISCORD_WEBHOOK_URL", "")
     
     state = load_state()
     seen_ids = set(state.get("seen_ids", []))
     
     posts = fetch_reddit_posts(subreddits, search_terms, max_age_hours)
-    logger.info(f"Fetched {len(posts)} total raw posts across {len(subreddits)} subreddits.")
+    logger.info(f"Fetched {len(posts)} total raw posts across {len(subreddits)} subreddits and {len(search_terms)} search terms.")
     
     new_posts = [p for p in posts if p["id"] not in seen_ids]
     logger.info(f"{len(new_posts)} posts remain after deduplication.")
     
     scored_leads = analyze_with_gemini(new_posts, gemini_api_key, gemini_model)
-    logger.info(f"Found {len(scored_leads)} qualified leads meeting threshold.")
+    logger.info(f"Found {len(scored_leads)} high-intent qualified leads.")
+    
+    scored_leads.sort(key=lambda x: x.get("score", 0), reverse=True)
     
     for lead in scored_leads:
         send_discord_notification(lead, discord_webhook)
         seen_ids.add(lead["id"])
+        time.sleep(0.2)
         
     state["seen_ids"] = list(seen_ids)
     save_state(state)
-    logger.info("SignalForge scan completed successfully.")
+    logger.info("SignalForge lead scan completed successfully.")
 
 if __name__ == "__main__":
     main()
