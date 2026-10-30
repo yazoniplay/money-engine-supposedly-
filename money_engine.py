@@ -206,10 +206,11 @@ def analyze_with_gemini(posts, api_key, model):
     return scored_posts
 
 def send_discord_notification(lead, webhook_url):
+    """Send one lead notification; return True only when delivery succeeds (or dry-run is intentional)."""
     if not webhook_url:
         logger.info(f"[DRY RUN DISCORD] Lead found: {lead['title']} ({lead['url']}) - Score: {lead['score']}/10")
-        return
-        
+        return True
+
     payload = {
         "embeds": [{
             "title": f"🚀 High-Intent AI Lead ({lead['score']}/10): {lead['title'][:200]}",
@@ -226,10 +227,55 @@ def send_discord_notification(lead, webhook_url):
     req = urllib.request.Request(webhook_url, data=data, headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            if resp.status not in (200, 204):
-                logger.warning(f"Discord notification failed with status {resp.status}")
+            if resp.status in (200, 204):
+                return True
+            logger.warning(f"Discord notification failed with status {resp.status}")
     except Exception as e:
         logger.error(f"Failed to send Discord webhook: {e}")
+    return False
+
+
+def _notification_record(lead):
+    """Keep only the fields needed to retry a Discord delivery."""
+    return {
+        "id": str(lead.get("id", "")),
+        "title": str(lead.get("title", "")),
+        "url": str(lead.get("url", "")),
+        "score": int(lead.get("score", 0)),
+        "rationale": str(lead.get("rationale", "")),
+        "source": str(lead.get("source", "unknown"))[:100],
+    }
+
+
+def retry_pending_notifications(state, webhook_url):
+    """Retry persisted deliveries; retain failures for a later run."""
+    pending = state.get("pending_notifications", [])
+    if not isinstance(pending, list):
+        pending = []
+    if not webhook_url:
+        return pending
+
+    remaining = []
+    for lead in pending:
+        if not send_discord_notification(lead, webhook_url):
+            remaining.append(lead)
+    return remaining
+
+
+def notify_or_queue_notification(lead, webhook_url, state):
+    """Deliver a new lead, persisting it if the configured webhook fails."""
+    if not webhook_url:
+        send_discord_notification(lead, webhook_url)
+        return
+
+    if send_discord_notification(lead, webhook_url):
+        return
+
+    record = _notification_record(lead)
+    pending = state.setdefault("pending_notifications", [])
+    if not any(existing.get("id") == record["id"] for existing in pending):
+        pending.append(record)
+        logger.warning(f"Queued lead {record['id']} for Discord retry after delivery failure.")
 
 def main():
     logger.info("Starting SignalForge high-speed expanded lead scan...")
@@ -253,7 +299,10 @@ def main():
         
     state = load_state()
     seen_ids = set(state.get("seen_ids", []))
-    
+    state["pending_notifications"] = retry_pending_notifications(state, discord_webhook)
+    if state["pending_notifications"]:
+        logger.warning(f"{len(state['pending_notifications'])} Discord notification(s) remain queued for retry.")
+
     logger.info(f"Scanning {len(subreddits)} subreddits with {len(search_terms)} search terms (Max age: {max_age_hours}h)...")
     posts = fetch_reddit_posts(subreddits, search_terms, max_age_hours)
     logger.info(f"Fetched {len(posts)} total raw posts across subreddits.")
@@ -263,6 +312,8 @@ def main():
     
     if not new_posts:
         logger.info("No new posts to analyze.")
+        state["seen_ids"] = list(seen_ids)
+        save_state(state)
         return
         
     logger.info(f"Analyzing {len(new_posts)} posts with Gemini / heuristics...")
@@ -270,9 +321,9 @@ def main():
     logger.info(f"Found {len(scored_leads)} high-intent leads meeting score threshold.")
     
     for lead in scored_leads:
-        send_discord_notification(lead, discord_webhook)
+        notify_or_queue_notification(lead, discord_webhook, state)
         time.sleep(0.2)
-        
+
     for p in new_posts:
         seen_ids.add(p["id"])
         
